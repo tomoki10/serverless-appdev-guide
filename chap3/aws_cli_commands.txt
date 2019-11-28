@@ -1,0 +1,85 @@
+
+# "123456789123" is aws account id
+# コメント前頭に*があるものは自作
+
+# データストリームの作成
+aws kinesis create-stream --stream-name sample --shard-count 1
+
+# データストリームの確認
+aws kinesis list-streams
+
+# SNSのトピック（複数のエンドポイント(LambdaやEメールなど)をまとめる論理アクセスポイント）を作成
+aws sns create-topic --name sample
+
+# CloudWatchログを設定
+aws cloudwatch put-metric-alarm \
+--alarm-name kinesis-mon --metric-name IncomingRecords \
+--namespace AWS/Kinesis --statistic Sum --period 60 \
+--threshold 10 --comparison-operator GreaterThanThreshold \
+--dimensions Name=StreamName,Value=sample \
+--evaluation-periods 1 \
+--alarm-actions arn:aws:sns:ap-northeast-1:123456789123:sample
+
+# アラームを強制的に発砲する（※エンドポイントはまだ設定していないので結果はコンソールなどから確認）
+aws cloudwatch set-alarm-state --alarm-name kinesis-mon \
+--state-reason 'initializing' --state-value ALARM
+
+# Lambda用のIAMロールを作成
+# "file://" をファイル名の前につけない場合失敗するので注意
+aws iam create-role --role-name resharding_function_role \
+ --assume-role-policy-document file://trustpolicy.json
+
+# Kinesis、CloudWatchへのフルアクセスポリシーをロールへ適応
+aws iam put-role-policy --role-name resharding_function_role \
+--policy-name basic-permission \
+--policy-document file://permission.json
+
+# デプロイパッケージを作成
+cd resharding-function/
+zip -r9 resharding-function.zip *
+
+# 固めたパッケージでLambdaを作成
+aws lambda create-function --function-name resharding_function \
+--zip-file fileb://resharding-function.zip \
+--role arn:aws:iam::123456789123:role/resharding_function_role \
+--handler resharding-function.lambda_handler --runtime python3.6
+
+# LambdaへSNSからの実行権限を追加
+aws lambda add-permission --function-name resharding_function \
+--statement-id 1 --action "lambda:InvokeFunction" \
+--principal sns.amazonaws.com \
+--source-arn arn:aws:sns:ap-northeast-1:123456789123:sample
+
+# SNSへLambdaをエンドポイントとして設定
+aws sns subscribe \
+--topic-arn arn:aws:sns:ap-northeast-1:123456789123:sample \
+--protocol lambda --notification-endpoint \
+arn:aws:lambda:ap-northeast-1:123456789123:function:resharding_function
+
+# Kinesisにデータ挿入
+python put-records.py
+
+# Kinesisのオープンシャード数を確認
+aws kinesis describe-stream-summary --stream-name sample
+
+# *アラームを戻す（再度アラームを発砲する用）
+aws cloudwatch set-alarm-state --alarm-name kinesis-mon \
+--state-reason 'initializing' --state-value INSUFFICIENT_DATA
+
+# アラームの発砲
+aws cloudwatch set-alarm-state --alarm-name kinesis-mon \
+--state-reason 'initializing' --state-value ALARM
+
+# 以下掃除作業
+
+## Lambda分
+# *作成したLambdaを確認
+aws lambda get-function --function-name resharding_function
+# *作成したLambdaの削除
+aws lambda delete-function --function-name resharding_function
+
+# Kinesis分
+# 作成したストリームを確認
+aws kinesis describe-stream-summary --stream-name sample
+# *ストリームの削除
+aws kinesis delete-stream --stream-name sample
